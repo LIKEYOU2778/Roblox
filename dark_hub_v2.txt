@@ -1,0 +1,1934 @@
+--!strict
+-- StarterPlayerScripts/CompactSandbox.client.lua
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+----------------------------------------------------------------
+-- 获取服务器授权
+----------------------------------------------------------------
+
+local remoteFolder = ReplicatedStorage:WaitForChild(
+	"CompactSandbox",
+	10
+)
+
+if not remoteFolder then
+	return
+end
+
+local ActionRemote = remoteFolder:WaitForChild(
+	"Action"
+) :: RemoteEvent
+
+local FeedbackRemote = remoteFolder:WaitForChild(
+	"Feedback"
+) :: RemoteEvent
+
+local QueryRemote = remoteFolder:WaitForChild(
+	"Query"
+) :: RemoteFunction
+
+local querySuccess, response = pcall(function()
+	return QueryRemote:InvokeServer()
+end)
+
+if not querySuccess
+	or not response
+	or response.authorized ~= true then
+
+	return
+end
+
+----------------------------------------------------------------
+-- 状态
+----------------------------------------------------------------
+
+local serverState: {[string]: boolean} = response.states or {}
+local flySpeed: number = response.flySpeed or 54
+
+local localState: {[string]: boolean} = {
+	ESP = false,
+	Fullbright = false,
+	WideFOV = false,
+	NoFog = false,
+	InfiniteJump = false,
+	TapTP = false,
+}
+
+local updateVisibleCards: (() -> ())?
+
+----------------------------------------------------------------
+-- 配色
+----------------------------------------------------------------
+
+local COLORS = {
+	Background = Color3.fromRGB(12, 15, 20),
+	Background2 = Color3.fromRGB(18, 22, 29),
+
+	Surface = Color3.fromRGB(23, 28, 36),
+	SurfaceActive = Color3.fromRGB(24, 42, 45),
+
+	Accent = Color3.fromRGB(77, 235, 199),
+	Accent2 = Color3.fromRGB(124, 105, 255),
+
+	Text = Color3.fromRGB(239, 243, 248),
+	TextMuted = Color3.fromRGB(135, 146, 161),
+
+	Stroke = Color3.fromRGB(61, 72, 87),
+	Danger = Color3.fromRGB(255, 92, 112),
+}
+
+local TWEEN_FAST = TweenInfo.new(
+	0.12,
+	Enum.EasingStyle.Quad,
+	Enum.EasingDirection.Out
+)
+
+local TWEEN_SMOOTH = TweenInfo.new(
+	0.22,
+	Enum.EasingStyle.Quint,
+	Enum.EasingDirection.Out
+)
+
+local TWEEN_SNAP = TweenInfo.new(
+	0.28,
+	Enum.EasingStyle.Quart,
+	Enum.EasingDirection.Out
+)
+
+----------------------------------------------------------------
+-- ESP：原生 Highlight，不使用逐帧绘制
+----------------------------------------------------------------
+
+local espHighlights: {[Player]: Highlight} = {}
+local espCharacterConnections: {[Player]: RBXScriptConnection} = {}
+
+local function removeESP(player: Player)
+	local highlight = espHighlights[player]
+
+	if highlight then
+		highlight:Destroy()
+		espHighlights[player] = nil
+	end
+end
+
+local function addESP(player: Player)
+	if player == LocalPlayer or not localState.ESP then
+		return
+	end
+
+	removeESP(player)
+
+	local character = player.Character
+
+	if not character then
+		return
+	end
+
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "__CompactSandboxESP"
+	highlight.Adornee = character
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.FillTransparency = 0.74
+	highlight.OutlineTransparency = 0.08
+
+	if player.Team then
+		highlight.FillColor = player.TeamColor.Color
+	else
+		highlight.FillColor = COLORS.Accent2
+	end
+
+	highlight.OutlineColor = Color3.fromRGB(245, 248, 255)
+	highlight.Parent = character
+
+	espHighlights[player] = highlight
+end
+
+local function bindESPPlayer(player: Player)
+	if espCharacterConnections[player] then
+		espCharacterConnections[player]:Disconnect()
+	end
+
+	espCharacterConnections[player] = player.CharacterAdded:Connect(
+		function()
+			task.wait(0.15)
+
+			if localState.ESP then
+				addESP(player)
+			end
+		end
+	)
+
+	if localState.ESP then
+		addESP(player)
+	end
+end
+
+local function refreshESP()
+	for player in pairs(espHighlights) do
+		removeESP(player)
+	end
+
+	if not localState.ESP then
+		return
+	end
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		addESP(player)
+	end
+end
+
+Players.PlayerAdded:Connect(bindESPPlayer)
+
+Players.PlayerRemoving:Connect(function(player)
+	removeESP(player)
+
+	local connection = espCharacterConnections[player]
+
+	if connection then
+		connection:Disconnect()
+		espCharacterConnections[player] = nil
+	end
+end)
+
+for _, player in ipairs(Players:GetPlayers()) do
+	bindESPPlayer(player)
+end
+
+----------------------------------------------------------------
+-- 光照和视野
+----------------------------------------------------------------
+
+local lightingBaseline = {
+	Brightness = Lighting.Brightness,
+	ClockTime = Lighting.ClockTime,
+	Ambient = Lighting.Ambient,
+	OutdoorAmbient = Lighting.OutdoorAmbient,
+	GlobalShadows = Lighting.GlobalShadows,
+	FogStart = Lighting.FogStart,
+	FogEnd = Lighting.FogEnd,
+}
+
+local atmosphereBaseline: {[Atmosphere]: {
+	Density: number,
+	Haze: number,
+	Glare: number,
+}} = {}
+
+for _, object in ipairs(Lighting:GetDescendants()) do
+	if object:IsA("Atmosphere") then
+		atmosphereBaseline[object] = {
+			Density = object.Density,
+			Haze = object.Haze,
+			Glare = object.Glare,
+		}
+	end
+end
+
+local originalFOVs: {[Camera]: number} = setmetatable(
+	{},
+	{__mode = "k"}
+)
+
+local function applyLighting()
+	if localState.Fullbright then
+		Lighting.Brightness = 3
+		Lighting.ClockTime = 14
+		Lighting.Ambient = Color3.fromRGB(190, 200, 215)
+		Lighting.OutdoorAmbient = Color3.fromRGB(170, 180, 200)
+		Lighting.GlobalShadows = false
+	else
+		Lighting.Brightness = lightingBaseline.Brightness
+		Lighting.ClockTime = lightingBaseline.ClockTime
+		Lighting.Ambient = lightingBaseline.Ambient
+		Lighting.OutdoorAmbient = lightingBaseline.OutdoorAmbient
+		Lighting.GlobalShadows = lightingBaseline.GlobalShadows
+	end
+
+	if localState.NoFog then
+		Lighting.FogStart = 0
+		Lighting.FogEnd = 1000000
+
+		for atmosphere in pairs(atmosphereBaseline) do
+			if atmosphere.Parent then
+				atmosphere.Density = 0
+				atmosphere.Haze = 0
+				atmosphere.Glare = 0
+			end
+		end
+	else
+		Lighting.FogStart = lightingBaseline.FogStart
+		Lighting.FogEnd = lightingBaseline.FogEnd
+
+		for atmosphere, original in pairs(atmosphereBaseline) do
+			if atmosphere.Parent then
+				atmosphere.Density = original.Density
+				atmosphere.Haze = original.Haze
+				atmosphere.Glare = original.Glare
+			end
+		end
+	end
+end
+
+local function applyFOV()
+	local camera = Workspace.CurrentCamera
+
+	if not camera then
+		return
+	end
+
+	if originalFOVs[camera] == nil then
+		originalFOVs[camera] = camera.FieldOfView
+	end
+
+	if localState.WideFOV then
+		camera.FieldOfView = 100
+	else
+		camera.FieldOfView = originalFOVs[camera]
+	end
+end
+
+----------------------------------------------------------------
+-- 平滑飞行：仅开启时运行 RenderStepped
+----------------------------------------------------------------
+
+local flyConnection: RBXScriptConnection?
+local flyAttachment: Attachment?
+local flyVelocity: LinearVelocity?
+local flyOrientation: AlignOrientation?
+local flyHumanoid: Humanoid?
+local flyRoot: BasePart?
+
+local flyOriginalPlatformStand = false
+local flyOriginalAutoRotate = true
+local flyBoostUntil = 0
+
+local function stopFly()
+	if flyConnection then
+		flyConnection:Disconnect()
+		flyConnection = nil
+	end
+
+	if flyVelocity then
+		flyVelocity:Destroy()
+		flyVelocity = nil
+	end
+
+	if flyOrientation then
+		flyOrientation:Destroy()
+		flyOrientation = nil
+	end
+
+	if flyAttachment then
+		flyAttachment:Destroy()
+		flyAttachment = nil
+	end
+
+	if flyRoot and flyRoot.Parent then
+		flyRoot.AssemblyLinearVelocity = Vector3.zero
+	end
+
+	if flyHumanoid and flyHumanoid.Parent then
+		flyHumanoid.PlatformStand = flyOriginalPlatformStand
+		flyHumanoid.AutoRotate = flyOriginalAutoRotate
+	end
+
+	flyHumanoid = nil
+	flyRoot = nil
+end
+
+local function startFly()
+	stopFly()
+
+	if not serverState.Fly then
+		return
+	end
+
+	local character = LocalPlayer.Character
+
+	if not character then
+		return
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+
+	if not humanoid or not root or not root:IsA("BasePart") then
+		return
+	end
+
+	flyHumanoid = humanoid
+	flyRoot = root
+
+	flyOriginalPlatformStand = humanoid.PlatformStand
+	flyOriginalAutoRotate = humanoid.AutoRotate
+
+	humanoid.PlatformStand = true
+	humanoid.AutoRotate = false
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "__CompactFlyAttachment"
+	attachment.Parent = root
+	flyAttachment = attachment
+
+	local velocity = Instance.new("LinearVelocity")
+	velocity.Name = "__CompactFlyVelocity"
+	velocity.Attachment0 = attachment
+	velocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	velocity.VelocityConstraintMode =
+		Enum.VelocityConstraintMode.Vector
+
+	velocity.MaxForce = 1000000
+	velocity.VectorVelocity = Vector3.zero
+	velocity.Parent = root
+	flyVelocity = velocity
+
+	local orientation = Instance.new("AlignOrientation")
+	orientation.Name = "__CompactFlyOrientation"
+	orientation.Mode =
+		Enum.OrientationAlignmentMode.OneAttachment
+
+	orientation.Attachment0 = attachment
+	orientation.MaxTorque = 1000000
+	orientation.Responsiveness = 22
+	orientation.RigidityEnabled = false
+	orientation.Parent = root
+	flyOrientation = orientation
+
+	flyConnection = RunService.RenderStepped:Connect(function()
+		if not serverState.Fly
+			or not root.Parent
+			or not humanoid.Parent then
+
+			stopFly()
+			return
+		end
+
+		local camera = Workspace.CurrentCamera
+
+		if not camera then
+			velocity.VectorVelocity = Vector3.zero
+			return
+		end
+
+		local cameraLook = camera.CFrame.LookVector
+		local cameraRight = camera.CFrame.RightVector
+
+		local flatLook = Vector3.new(
+			cameraLook.X,
+			0,
+			cameraLook.Z
+		)
+
+		local flatRight = Vector3.new(
+			cameraRight.X,
+			0,
+			cameraRight.Z
+		)
+
+		if flatLook.Magnitude < 0.001 then
+			flatLook = Vector3.new(
+				root.CFrame.LookVector.X,
+				0,
+				root.CFrame.LookVector.Z
+			)
+		end
+
+		if flatRight.Magnitude < 0.001 then
+			flatRight = Vector3.new(1, 0, 0)
+		end
+
+		flatLook = flatLook.Unit
+		flatRight = flatRight.Unit
+
+		local moveDirection = humanoid.MoveDirection
+		local forwardAmount = moveDirection:Dot(flatLook)
+		local rightAmount = moveDirection:Dot(flatRight)
+
+		-- 向前移动时，镜头俯仰控制升降
+		local verticalAmount = cameraLook.Y * forwardAmount
+
+		-- 手机原生跳跃键用于短暂向上推进
+		if os.clock() < flyBoostUntil then
+			verticalAmount += 1
+		end
+
+		local direction =
+			flatLook * forwardAmount
+			+ flatRight * rightAmount
+			+ Vector3.new(0, verticalAmount, 0)
+
+		if direction.Magnitude > 1 then
+			direction = direction.Unit
+		end
+
+		velocity.VectorVelocity = direction * flySpeed
+
+		orientation.CFrame = CFrame.lookAt(
+			Vector3.zero,
+			flatLook,
+			Vector3.new(0, 1, 0)
+		)
+	end)
+end
+
+LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(0.3)
+
+	if serverState.Fly then
+		startFly()
+	end
+end)
+
+----------------------------------------------------------------
+-- 无限跳跃及飞行上升
+----------------------------------------------------------------
+
+UserInputService.JumpRequest:Connect(function()
+	if serverState.Fly then
+		flyBoostUntil = os.clock() + 0.22
+		return
+	end
+
+	if not localState.InfiniteJump then
+		return
+	end
+
+	local character = LocalPlayer.Character
+	local humanoid = character
+		and character:FindFirstChildOfClass("Humanoid")
+
+	if humanoid then
+		humanoid:ChangeState(
+			Enum.HumanoidStateType.Jumping
+		)
+	end
+end)
+
+----------------------------------------------------------------
+-- 手机点击传送
+----------------------------------------------------------------
+
+UserInputService.TouchTapInWorld:Connect(function(
+	touchPositions,
+	processedByUI
+)
+	if not localState.TapTP or processedByUI then
+		return
+	end
+
+	local camera = Workspace.CurrentCamera
+	local touchPosition = touchPositions[1]
+
+	if not camera or not touchPosition then
+		return
+	end
+
+	local ray = camera:ViewportPointToRay(
+		touchPosition.X,
+		touchPosition.Y
+	)
+
+	local raycastParameters = RaycastParams.new()
+	raycastParameters.FilterType =
+		Enum.RaycastFilterType.Exclude
+
+	raycastParameters.FilterDescendantsInstances = {
+		LocalPlayer.Character,
+	}
+
+	local result = Workspace:Raycast(
+		ray.Origin,
+		ray.Direction * 1000,
+		raycastParameters
+	)
+
+	if result then
+		ActionRemote:FireServer(
+			"Teleport",
+			result.Position
+		)
+	end
+end)
+
+----------------------------------------------------------------
+-- 本地功能管理
+----------------------------------------------------------------
+
+local function setLocalFeature(key: string, enabled: boolean)
+	if localState[key] == nil then
+		return
+	end
+
+	localState[key] = enabled
+
+	if key == "ESP" then
+		refreshESP()
+
+	elseif key == "Fullbright" or key == "NoFog" then
+		applyLighting()
+
+	elseif key == "WideFOV" then
+		applyFOV()
+	end
+
+	if updateVisibleCards then
+		updateVisibleCards()
+	end
+end
+
+local function resetLocalFeatures()
+	for key in pairs(localState) do
+		localState[key] = false
+	end
+
+	refreshESP()
+	applyLighting()
+	applyFOV()
+
+	if updateVisibleCards then
+		updateVisibleCards()
+	end
+end
+
+----------------------------------------------------------------
+-- 页面数据：每页只显示四项，减少视觉拥挤
+----------------------------------------------------------------
+
+local pages = {
+	{
+		title = "移动能力",
+		tab = "移动",
+		items = {
+			{
+				key = "Fly",
+				label = "飞行",
+				icon = "△",
+				mode = "serverToggle",
+			},
+			{
+				key = "Noclip",
+				label = "穿墙",
+				icon = "◇",
+				mode = "serverToggle",
+			},
+			{
+				key = "Speed",
+				label = "疾跑",
+				icon = "»",
+				mode = "serverToggle",
+			},
+			{
+				key = "HighJump",
+				label = "高跳",
+				icon = "↑",
+				mode = "serverToggle",
+			},
+		},
+	},
+	{
+		title = "视觉辅助",
+		tab = "视觉",
+		items = {
+			{
+				key = "ESP",
+				label = "高亮",
+				icon = "◎",
+				mode = "localToggle",
+			},
+			{
+				key = "Fullbright",
+				label = "全亮",
+				icon = "☀",
+				mode = "localToggle",
+			},
+			{
+				key = "WideFOV",
+				label = "广角",
+				icon = "◫",
+				mode = "localToggle",
+			},
+			{
+				key = "NoFog",
+				label = "无雾",
+				icon = "≋",
+				mode = "localToggle",
+			},
+		},
+	},
+	{
+		title = "高级辅助",
+		tab = "辅助",
+		items = {
+			{
+				key = "LowGravity",
+				label = "低重力",
+				icon = "○",
+				mode = "serverToggle",
+			},
+			{
+				key = "InfiniteJump",
+				label = "连跳",
+				icon = "↟",
+				mode = "localToggle",
+			},
+			{
+				key = "TapTP",
+				label = "点击传送",
+				icon = "⌖",
+				mode = "localToggle",
+			},
+			{
+				key = "Ghost",
+				label = "幽灵",
+				icon = "◌",
+				mode = "serverToggle",
+			},
+		},
+	},
+	{
+		title = "恢复工具",
+		tab = "工具",
+		items = {
+			{
+				key = "SavePoint",
+				label = "保存位置",
+				icon = "+",
+				mode = "action",
+			},
+			{
+				key = "ReturnPoint",
+				label = "返回位置",
+				icon = "↶",
+				mode = "action",
+			},
+			{
+				key = "Heal",
+				label = "恢复生命",
+				icon = "♥",
+				mode = "action",
+			},
+			{
+				key = "Panic",
+				label = "全部恢复",
+				icon = "!",
+				mode = "action",
+				danger = true,
+			},
+		},
+	},
+}
+
+----------------------------------------------------------------
+-- UI 基础
+----------------------------------------------------------------
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "CompactSandboxUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = false
+ScreenGui.DisplayOrder = 50
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local Main = Instance.new("CanvasGroup")
+Main.Name = "Main"
+Main.AnchorPoint = Vector2.zero
+Main.BackgroundColor3 = COLORS.Background
+Main.BorderSizePixel = 0
+Main.ClipsDescendants = true
+Main.GroupTransparency = 0
+Main.Visible = true
+Main.Active = true
+Main.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 14)
+MainCorner.Parent = Main
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(72, 85, 102)
+MainStroke.Transparency = 0.35
+MainStroke.Thickness = 1
+MainStroke.Parent = Main
+
+local MainGradient = Instance.new("UIGradient")
+MainGradient.Rotation = 120
+MainGradient.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(
+		0,
+		Color3.fromRGB(19, 24, 31)
+	),
+	ColorSequenceKeypoint.new(
+		0.55,
+		Color3.fromRGB(13, 17, 22)
+	),
+	ColorSequenceKeypoint.new(
+		1,
+		Color3.fromRGB(20, 18, 31)
+	),
+})
+MainGradient.Parent = Main
+
+local MainScale = Instance.new("UIScale")
+MainScale.Scale = 1
+MainScale.Parent = Main
+
+local AccentLine = Instance.new("Frame")
+AccentLine.Name = "AccentLine"
+AccentLine.Size = UDim2.new(1, 0, 0, 2)
+AccentLine.Position = UDim2.fromOffset(0, 0)
+AccentLine.BorderSizePixel = 0
+AccentLine.BackgroundColor3 = COLORS.Accent
+AccentLine.ZIndex = 10
+AccentLine.Parent = Main
+
+local AccentGradient = Instance.new("UIGradient")
+AccentGradient.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, COLORS.Accent),
+	ColorSequenceKeypoint.new(1, COLORS.Accent2),
+})
+AccentGradient.Parent = AccentLine
+
+----------------------------------------------------------------
+-- 标题栏
+----------------------------------------------------------------
+
+local Header = Instance.new("Frame")
+Header.Name = "Header"
+Header.Size = UDim2.fromScale(1, 0.21)
+Header.BackgroundTransparency = 1
+Header.Active = true
+Header.ZIndex = 3
+Header.Parent = Main
+
+local StatusDot = Instance.new("Frame")
+StatusDot.AnchorPoint = Vector2.new(0, 0.5)
+StatusDot.Size = UDim2.fromOffset(6, 6)
+StatusDot.Position = UDim2.new(0, 10, 0.5, 0)
+StatusDot.BackgroundColor3 = COLORS.Accent
+StatusDot.BorderSizePixel = 0
+StatusDot.ZIndex = 4
+StatusDot.Parent = Header
+
+local StatusCorner = Instance.new("UICorner")
+StatusCorner.CornerRadius = UDim.new(1, 0)
+StatusCorner.Parent = StatusDot
+
+local PageTitle = Instance.new("TextLabel")
+PageTitle.Size = UDim2.new(1, -92, 1, 0)
+PageTitle.Position = UDim2.fromOffset(22, 0)
+PageTitle.BackgroundTransparency = 1
+PageTitle.Font = Enum.Font.GothamBold
+PageTitle.Text = "移动能力"
+PageTitle.TextColor3 = COLORS.Text
+PageTitle.TextScaled = true
+PageTitle.TextXAlignment = Enum.TextXAlignment.Left
+PageTitle.TextTruncate = Enum.TextTruncate.AtEnd
+PageTitle.ZIndex = 4
+PageTitle.Parent = Header
+
+local PageTitleConstraint = Instance.new("UITextSizeConstraint")
+PageTitleConstraint.MinTextSize = 9
+PageTitleConstraint.MaxTextSize = 13
+PageTitleConstraint.Parent = PageTitle
+
+local AreaBadge = Instance.new("TextLabel")
+AreaBadge.AnchorPoint = Vector2.new(1, 0.5)
+AreaBadge.Size = UDim2.fromOffset(30, 18)
+AreaBadge.Position = UDim2.new(1, -34, 0.5, 0)
+AreaBadge.BackgroundColor3 = Color3.fromRGB(27, 33, 42)
+AreaBadge.BackgroundTransparency = 0.1
+AreaBadge.BorderSizePixel = 0
+AreaBadge.Font = Enum.Font.GothamBold
+AreaBadge.Text = "1/8"
+AreaBadge.TextColor3 = COLORS.Accent
+AreaBadge.TextScaled = true
+AreaBadge.ZIndex = 4
+AreaBadge.Parent = Header
+
+local BadgeCorner = Instance.new("UICorner")
+BadgeCorner.CornerRadius = UDim.new(1, 0)
+BadgeCorner.Parent = AreaBadge
+
+local BadgeConstraint = Instance.new("UITextSizeConstraint")
+BadgeConstraint.MinTextSize = 7
+BadgeConstraint.MaxTextSize = 10
+BadgeConstraint.Parent = AreaBadge
+
+local CloseButton = Instance.new("TextButton")
+CloseButton.AnchorPoint = Vector2.new(1, 0.5)
+CloseButton.Size = UDim2.fromOffset(26, 26)
+CloseButton.Position = UDim2.new(1, -4, 0.5, 0)
+CloseButton.BackgroundTransparency = 1
+CloseButton.AutoButtonColor = false
+CloseButton.Font = Enum.Font.GothamBold
+CloseButton.Text = "—"
+CloseButton.TextColor3 = COLORS.TextMuted
+CloseButton.TextScaled = true
+CloseButton.ZIndex = 5
+CloseButton.Parent = Header
+
+local CloseConstraint = Instance.new("UITextSizeConstraint")
+CloseConstraint.MinTextSize = 10
+CloseConstraint.MaxTextSize = 15
+CloseConstraint.Parent = CloseButton
+
+----------------------------------------------------------------
+-- 功能内容区
+----------------------------------------------------------------
+
+local Content = Instance.new("CanvasGroup")
+Content.Name = "Content"
+Content.Size = UDim2.fromScale(1, 0.57)
+Content.Position = UDim2.fromScale(0, 0.21)
+Content.BackgroundTransparency = 1
+Content.GroupTransparency = 0
+Content.ZIndex = 3
+Content.Parent = Main
+
+local ContentPadding = Instance.new("UIPadding")
+ContentPadding.PaddingLeft = UDim.new(0, 6)
+ContentPadding.PaddingRight = UDim.new(0, 6)
+ContentPadding.PaddingTop = UDim.new(0, 4)
+ContentPadding.PaddingBottom = UDim.new(0, 4)
+ContentPadding.Parent = Content
+
+local Grid = Instance.new("UIGridLayout")
+Grid.CellSize = UDim2.new(0.5, -3, 0.5, -3)
+Grid.CellPadding = UDim2.fromOffset(6, 6)
+Grid.SortOrder = Enum.SortOrder.LayoutOrder
+Grid.Parent = Content
+
+----------------------------------------------------------------
+-- 底部导航
+----------------------------------------------------------------
+
+local Navigation = Instance.new("Frame")
+Navigation.Name = "Navigation"
+Navigation.Size = UDim2.fromScale(1, 0.22)
+Navigation.Position = UDim2.fromScale(0, 0.78)
+Navigation.BackgroundColor3 = Color3.fromRGB(9, 12, 16)
+Navigation.BackgroundTransparency = 0.18
+Navigation.BorderSizePixel = 0
+Navigation.ZIndex = 3
+Navigation.Parent = Main
+
+local NavTopLine = Instance.new("Frame")
+NavTopLine.Size = UDim2.new(1, -12, 0, 1)
+NavTopLine.Position = UDim2.fromOffset(6, 0)
+NavTopLine.BackgroundColor3 = COLORS.Stroke
+NavTopLine.BackgroundTransparency = 0.55
+NavTopLine.BorderSizePixel = 0
+NavTopLine.ZIndex = 4
+NavTopLine.Parent = Navigation
+
+local navButtons = {}
+
+for index, page in ipairs(pages) do
+	local button = Instance.new("TextButton")
+	button.Name = "Tab" .. index
+	button.Size = UDim2.new(1 / #pages, -4, 1, -8)
+	button.Position = UDim2.new(
+		(index - 1) / #pages,
+		2,
+		0,
+		4
+	)
+
+	button.BackgroundColor3 = COLORS.Surface
+	button.BackgroundTransparency = 1
+	button.BorderSizePixel = 0
+	button.AutoButtonColor = false
+	button.Font = Enum.Font.GothamMedium
+	button.Text = page.tab
+	button.TextColor3 = COLORS.TextMuted
+	button.TextScaled = true
+	button.ZIndex = 5
+	button.Parent = Navigation
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = button
+
+	local constraint = Instance.new("UITextSizeConstraint")
+	constraint.MinTextSize = 7
+	constraint.MaxTextSize = 10
+	constraint.Parent = button
+
+	local indicator = Instance.new("Frame")
+	indicator.AnchorPoint = Vector2.new(0.5, 1)
+	indicator.Size = UDim2.new(0.34, 0, 0, 2)
+	indicator.Position = UDim2.new(0.5, 0, 1, -1)
+	indicator.BackgroundColor3 = COLORS.Accent
+	indicator.BackgroundTransparency = 1
+	indicator.BorderSizePixel = 0
+	indicator.ZIndex = 6
+	indicator.Parent = button
+
+	local indicatorCorner = Instance.new("UICorner")
+	indicatorCorner.CornerRadius = UDim.new(1, 0)
+	indicatorCorner.Parent = indicator
+
+	navButtons[index] = {
+		button = button,
+		indicator = indicator,
+	}
+end
+
+----------------------------------------------------------------
+-- Toast
+----------------------------------------------------------------
+
+local Toast = Instance.new("CanvasGroup")
+Toast.AnchorPoint = Vector2.new(0.5, 0.5)
+Toast.Size = UDim2.new(0.78, 0, 0, 30)
+Toast.Position = UDim2.fromScale(0.5, 0.5)
+Toast.BackgroundColor3 = Color3.fromRGB(28, 34, 43)
+Toast.BorderSizePixel = 0
+Toast.GroupTransparency = 1
+Toast.Visible = false
+Toast.ZIndex = 30
+Toast.Parent = Main
+
+local ToastCorner = Instance.new("UICorner")
+ToastCorner.CornerRadius = UDim.new(1, 0)
+ToastCorner.Parent = Toast
+
+local ToastStroke = Instance.new("UIStroke")
+ToastStroke.Color = COLORS.Accent
+ToastStroke.Transparency = 0.45
+ToastStroke.Parent = Toast
+
+local ToastScale = Instance.new("UIScale")
+ToastScale.Scale = 0.94
+ToastScale.Parent = Toast
+
+local ToastText = Instance.new("TextLabel")
+ToastText.Size = UDim2.new(1, -16, 1, 0)
+ToastText.Position = UDim2.fromOffset(8, 0)
+ToastText.BackgroundTransparency = 1
+ToastText.Font = Enum.Font.GothamMedium
+ToastText.TextColor3 = COLORS.Text
+ToastText.TextScaled = true
+ToastText.Text = ""
+ToastText.ZIndex = 31
+ToastText.Parent = Toast
+
+local ToastTextConstraint = Instance.new("UITextSizeConstraint")
+ToastTextConstraint.MinTextSize = 8
+ToastTextConstraint.MaxTextSize = 11
+ToastTextConstraint.Parent = ToastText
+
+local toastSerial = 0
+
+local function showToast(text: string)
+	toastSerial += 1
+	local currentSerial = toastSerial
+
+	ToastText.Text = text
+	Toast.Visible = true
+	Toast.GroupTransparency = 1
+	ToastScale.Scale = 0.94
+
+	TweenService:Create(
+		Toast,
+		TWEEN_FAST,
+		{GroupTransparency = 0}
+	):Play()
+
+	TweenService:Create(
+		ToastScale,
+		TWEEN_SMOOTH,
+		{Scale = 1}
+	):Play()
+
+	task.delay(1.25, function()
+		if currentSerial ~= toastSerial then
+			return
+		end
+
+		TweenService:Create(
+			Toast,
+			TWEEN_FAST,
+			{GroupTransparency = 1}
+		):Play()
+
+		task.delay(0.14, function()
+			if currentSerial == toastSerial then
+				Toast.Visible = false
+			end
+		end)
+	end)
+end
+
+----------------------------------------------------------------
+-- 悬浮球
+----------------------------------------------------------------
+
+local OpenButton = Instance.new("TextButton")
+OpenButton.Name = "OpenButton"
+OpenButton.AnchorPoint = Vector2.zero
+OpenButton.Size = UDim2.fromOffset(42, 42)
+OpenButton.BackgroundColor3 = COLORS.Background2
+OpenButton.BorderSizePixel = 0
+OpenButton.AutoButtonColor = false
+OpenButton.Font = Enum.Font.GothamBold
+OpenButton.Text = "◆"
+OpenButton.TextColor3 = COLORS.Accent
+OpenButton.TextScaled = true
+OpenButton.Visible = false
+OpenButton.ZIndex = 40
+OpenButton.Parent = ScreenGui
+
+local OpenCorner = Instance.new("UICorner")
+OpenCorner.CornerRadius = UDim.new(1, 0)
+OpenCorner.Parent = OpenButton
+
+local OpenStroke = Instance.new("UIStroke")
+OpenStroke.Color = COLORS.Accent
+OpenStroke.Transparency = 0.25
+OpenStroke.Thickness = 1.3
+OpenStroke.Parent = OpenButton
+
+local OpenGradient = Instance.new("UIGradient")
+OpenGradient.Rotation = 135
+OpenGradient.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(
+		0,
+		Color3.fromRGB(25, 34, 41)
+	),
+	ColorSequenceKeypoint.new(
+		1,
+		Color3.fromRGB(26, 22, 43)
+	),
+})
+OpenGradient.Parent = OpenButton
+
+local OpenScale = Instance.new("UIScale")
+OpenScale.Scale = 1
+OpenScale.Parent = OpenButton
+
+local OpenTextConstraint = Instance.new("UITextSizeConstraint")
+OpenTextConstraint.MinTextSize = 14
+OpenTextConstraint.MaxTextSize = 19
+OpenTextConstraint.Parent = OpenButton
+
+----------------------------------------------------------------
+-- 精确计算 1/8 屏幕面积
+----------------------------------------------------------------
+
+local panelWidth = 220
+local panelHeight = 190
+local orbSize = 42
+local edgeMargin = 8
+
+local function getViewportSize(): Vector2
+	local camera = Workspace.CurrentCamera
+
+	if camera then
+		return camera.ViewportSize
+	end
+
+	return Vector2.new(800, 600)
+end
+
+local function calculatePanelDimensions(): (number, number)
+	local viewport = getViewportSize()
+
+	-- 面积固定为整块屏幕的 1/8
+	local targetArea = viewport.X * viewport.Y / 8
+
+	-- 根据横竖屏调整宽高比，但面积不变
+	local aspectRatio
+
+	if viewport.X >= viewport.Y then
+		aspectRatio = 2.05
+	else
+		aspectRatio = 1.15
+	end
+
+	local width = math.sqrt(targetArea * aspectRatio)
+	local height = targetArea / width
+
+	-- 理论上 1/8 面积不会超出屏幕；这里处理极端设备
+	if width > viewport.X - edgeMargin * 2 then
+		width = viewport.X - edgeMargin * 2
+		height = targetArea / width
+	end
+
+	if height > viewport.Y - edgeMargin * 2 then
+		height = viewport.Y - edgeMargin * 2
+		width = targetArea / height
+	end
+
+	return math.floor(width + 0.5), math.floor(height + 0.5)
+end
+
+local function clampMainPosition(position: UDim2): UDim2
+	local viewport = getViewportSize()
+
+	local x = math.clamp(
+		position.X.Offset,
+		edgeMargin,
+		math.max(edgeMargin, viewport.X - panelWidth - edgeMargin)
+	)
+
+	local y = math.clamp(
+		position.Y.Offset,
+		edgeMargin,
+		math.max(edgeMargin, viewport.Y - panelHeight - edgeMargin)
+	)
+
+	return UDim2.fromOffset(x, y)
+end
+
+local function clampOrbPosition(position: UDim2): UDim2
+	local viewport = getViewportSize()
+
+	local x = math.clamp(
+		position.X.Offset,
+		edgeMargin,
+		math.max(edgeMargin, viewport.X - orbSize - edgeMargin)
+	)
+
+	local y = math.clamp(
+		position.Y.Offset,
+		edgeMargin,
+		math.max(edgeMargin, viewport.Y - orbSize - edgeMargin)
+	)
+
+	return UDim2.fromOffset(x, y)
+end
+
+local function updatePanelGeometry(initial: boolean?)
+	panelWidth, panelHeight = calculatePanelDimensions()
+
+	local viewport = getViewportSize()
+	orbSize = math.clamp(
+		math.floor(math.min(viewport.X, viewport.Y) * 0.1),
+		38,
+		46
+	)
+
+	Main.Size = UDim2.fromOffset(panelWidth, panelHeight)
+	OpenButton.Size = UDim2.fromOffset(orbSize, orbSize)
+
+	if initial then
+		Main.Position = UDim2.fromOffset(
+			viewport.X - panelWidth - edgeMargin,
+			math.floor((viewport.Y - panelHeight) / 2)
+		)
+
+		OpenButton.Position = UDim2.fromOffset(
+			viewport.X - orbSize - edgeMargin,
+			math.floor((viewport.Y - orbSize) / 2)
+		)
+	else
+		Main.Position = clampMainPosition(Main.Position)
+		OpenButton.Position = clampOrbPosition(OpenButton.Position)
+	end
+end
+
+----------------------------------------------------------------
+-- 卡片
+----------------------------------------------------------------
+
+local cards: {[string]: any} = {}
+local currentPage = 1
+local pageSwitchSerial = 0
+
+local function featureIsEnabled(definition): boolean
+	if definition.mode == "serverToggle" then
+		return serverState[definition.key] == true
+	end
+
+	if definition.mode == "localToggle" then
+		return localState[definition.key] == true
+	end
+
+	return false
+end
+
+local function updateCard(card)
+	local definition = card.definition
+	local enabled = featureIsEnabled(definition)
+
+	if definition.mode == "action" then
+		card.dot.Visible = false
+
+		if definition.danger then
+			card.icon.TextColor3 = COLORS.Danger
+		else
+			card.icon.TextColor3 = COLORS.Accent2
+		end
+
+		return
+	end
+
+	card.dot.Visible = true
+
+	TweenService:Create(
+		card.button,
+		TWEEN_FAST,
+		{
+			BackgroundColor3 = enabled
+				and COLORS.SurfaceActive
+				or COLORS.Surface,
+		}
+	):Play()
+
+	TweenService:Create(
+		card.stroke,
+		TWEEN_FAST,
+		{
+			Color = enabled and COLORS.Accent or COLORS.Stroke,
+			Transparency = enabled and 0.15 or 0.74,
+		}
+	):Play()
+
+	TweenService:Create(
+		card.dot,
+		TWEEN_FAST,
+		{
+			BackgroundColor3 = enabled
+				and COLORS.Accent
+				or COLORS.TextMuted,
+
+			BackgroundTransparency = enabled and 0 or 0.48,
+		}
+	):Play()
+
+	card.icon.TextColor3 =
+		enabled and COLORS.Accent or COLORS.TextMuted
+
+	card.label.TextColor3 =
+		enabled and COLORS.Text or Color3.fromRGB(205, 212, 222)
+end
+
+updateVisibleCards = function()
+	for _, card in pairs(cards) do
+		updateCard(card)
+	end
+end
+
+local function pulseCard(scale: UIScale)
+	TweenService:Create(
+		scale,
+		TWEEN_FAST,
+		{Scale = 0.95}
+	):Play()
+
+	task.delay(0.07, function()
+		if scale.Parent then
+			TweenService:Create(
+				scale,
+				TWEEN_SMOOTH,
+				{Scale = 1}
+			):Play()
+		end
+	end)
+end
+
+local function activateFeature(definition)
+	if definition.mode == "serverToggle" then
+		local desired = not serverState[definition.key]
+
+		ActionRemote:FireServer(
+			"Toggle",
+			definition.key,
+			desired
+		)
+
+	elseif definition.mode == "localToggle" then
+		setLocalFeature(
+			definition.key,
+			not localState[definition.key]
+		)
+
+	elseif definition.mode == "action" then
+		if definition.key == "Panic" then
+			resetLocalFeatures()
+		end
+
+		ActionRemote:FireServer(
+			"Action",
+			definition.key
+		)
+	end
+end
+
+local function clearCards()
+	for _, child in ipairs(Content:GetChildren()) do
+		if child:IsA("GuiButton") then
+			child:Destroy()
+		end
+	end
+
+	table.clear(cards)
+end
+
+local function createCard(definition, layoutOrder: number)
+	local button = Instance.new("TextButton")
+	button.Name = definition.key
+	button.LayoutOrder = layoutOrder
+	button.BackgroundColor3 = COLORS.Surface
+	button.BorderSizePixel = 0
+	button.AutoButtonColor = false
+	button.Text = ""
+	button.ZIndex = 5
+	button.Parent = Content
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 9)
+	corner.Parent = button
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = COLORS.Stroke
+	stroke.Transparency = 0.74
+	stroke.Thickness = 1
+	stroke.Parent = button
+
+	local scale = Instance.new("UIScale")
+	scale.Scale = 1
+	scale.Parent = button
+
+	local icon = Instance.new("TextLabel")
+	icon.Size = UDim2.new(0.3, 0, 1, 0)
+	icon.Position = UDim2.fromOffset(5, 0)
+	icon.BackgroundTransparency = 1
+	icon.Font = Enum.Font.GothamBold
+	icon.Text = definition.icon
+	icon.TextColor3 = COLORS.TextMuted
+	icon.TextScaled = true
+	icon.ZIndex = 6
+	icon.Parent = button
+
+	local iconConstraint = Instance.new("UITextSizeConstraint")
+	iconConstraint.MinTextSize = 10
+	iconConstraint.MaxTextSize = 17
+	iconConstraint.Parent = icon
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(0.66, -8, 1, 0)
+	label.Position = UDim2.new(0.3, 4, 0, 0)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamMedium
+	label.Text = definition.label
+	label.TextColor3 = Color3.fromRGB(205, 212, 222)
+	label.TextScaled = true
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextTruncate = Enum.TextTruncate.AtEnd
+	label.ZIndex = 6
+	label.Parent = button
+
+	local labelConstraint = Instance.new("UITextSizeConstraint")
+	labelConstraint.MinTextSize = 7
+	labelConstraint.MaxTextSize = 11
+	labelConstraint.Parent = label
+
+	local dot = Instance.new("Frame")
+	dot.AnchorPoint = Vector2.new(1, 0)
+	dot.Size = UDim2.fromOffset(5, 5)
+	dot.Position = UDim2.new(1, -6, 0, 6)
+	dot.BackgroundColor3 = COLORS.TextMuted
+	dot.BackgroundTransparency = 0.48
+	dot.BorderSizePixel = 0
+	dot.ZIndex = 7
+	dot.Parent = button
+
+	local dotCorner = Instance.new("UICorner")
+	dotCorner.CornerRadius = UDim.new(1, 0)
+	dotCorner.Parent = dot
+
+	local card = {
+		button = button,
+		stroke = stroke,
+		scale = scale,
+		icon = icon,
+		label = label,
+		dot = dot,
+		definition = definition,
+	}
+
+	cards[definition.key] = card
+
+	button.Activated:Connect(function()
+		pulseCard(scale)
+		activateFeature(definition)
+	end)
+
+	updateCard(card)
+end
+
+local function buildPage(pageIndex: number)
+	clearCards()
+
+	local page = pages[pageIndex]
+	PageTitle.Text = page.title
+
+	for index, definition in ipairs(page.items) do
+		createCard(definition, index)
+	end
+end
+
+local function updateNavigation()
+	for index, nav in ipairs(navButtons) do
+		local selected = index == currentPage
+
+		TweenService:Create(
+			nav.button,
+			TWEEN_FAST,
+			{
+				BackgroundTransparency = selected and 0.3 or 1,
+				TextColor3 = selected
+					and COLORS.Text
+					or COLORS.TextMuted,
+			}
+		):Play()
+
+		TweenService:Create(
+			nav.indicator,
+			TWEEN_FAST,
+			{
+				BackgroundTransparency = selected and 0 or 1,
+			}
+		):Play()
+	end
+end
+
+local function switchPage(pageIndex: number, instant: boolean?)
+	if not pages[pageIndex] then
+		return
+	end
+
+	currentPage = pageIndex
+	updateNavigation()
+
+	pageSwitchSerial += 1
+	local serial = pageSwitchSerial
+
+	if instant then
+		Content.GroupTransparency = 0
+		Content.Position = UDim2.fromScale(0, 0.21)
+		buildPage(pageIndex)
+		return
+	end
+
+	TweenService:Create(
+		Content,
+		TWEEN_FAST,
+		{
+			GroupTransparency = 1,
+			Position = UDim2.new(0, 8, 0.21, 0),
+		}
+	):Play()
+
+	task.delay(0.12, function()
+		if serial ~= pageSwitchSerial then
+			return
+		end
+
+		buildPage(pageIndex)
+
+		Content.Position = UDim2.new(0, -8, 0.21, 0)
+
+		TweenService:Create(
+			Content,
+			TWEEN_SMOOTH,
+			{
+				GroupTransparency = 0,
+				Position = UDim2.fromScale(0, 0.21),
+			}
+		):Play()
+	end)
+end
+
+for index, nav in ipairs(navButtons) do
+	nav.button.Activated:Connect(function()
+		if currentPage ~= index then
+			switchPage(index)
+		end
+	end)
+end
+
+----------------------------------------------------------------
+-- 展开和收起
+----------------------------------------------------------------
+
+local panelAnimationSerial = 0
+
+local function positionMainFromOrb()
+	local viewport = getViewportSize()
+	local orbPosition = OpenButton.Position
+
+	local orbCenterX = orbPosition.X.Offset + orbSize / 2
+	local onRight = orbCenterX >= viewport.X / 2
+
+	local targetX
+
+	if onRight then
+		targetX = viewport.X - panelWidth - edgeMargin
+	else
+		targetX = edgeMargin
+	end
+
+	local targetY = math.clamp(
+		orbPosition.Y.Offset + orbSize / 2 - panelHeight / 2,
+		edgeMargin,
+		math.max(edgeMargin, viewport.Y - panelHeight - edgeMargin)
+	)
+
+	Main.Position = UDim2.fromOffset(targetX, targetY)
+end
+
+local function showPanel()
+	panelAnimationSerial += 1
+
+	positionMainFromOrb()
+
+	OpenButton.Visible = false
+	Main.Visible = true
+	Main.GroupTransparency = 1
+	MainScale.Scale = 0.9
+
+	TweenService:Create(
+		Main,
+		TWEEN_SMOOTH,
+		{GroupTransparency = 0}
+	):Play()
+
+	TweenService:Create(
+		MainScale,
+		TWEEN_SMOOTH,
+		{Scale = 1}
+	):Play()
+end
+
+local function hidePanel()
+	panelAnimationSerial += 1
+	local serial = panelAnimationSerial
+
+	local viewport = getViewportSize()
+	local mainCenterX = Main.Position.X.Offset + panelWidth / 2
+
+	local orbX
+
+	if mainCenterX < viewport.X / 2 then
+		orbX = edgeMargin
+	else
+		orbX = viewport.X - orbSize - edgeMargin
+	end
+
+	local orbY = math.clamp(
+		Main.Position.Y.Offset + panelHeight / 2 - orbSize / 2,
+		edgeMargin,
+		math.max(edgeMargin, viewport.Y - orbSize - edgeMargin)
+	)
+
+	OpenButton.Position = UDim2.fromOffset(orbX, orbY)
+
+	TweenService:Create(
+		Main,
+		TWEEN_FAST,
+		{GroupTransparency = 1}
+	):Play()
+
+	TweenService:Create(
+		MainScale,
+		TWEEN_FAST,
+		{Scale = 0.92}
+	):Play()
+
+	task.delay(0.13, function()
+		if serial ~= panelAnimationSerial then
+			return
+		end
+
+		Main.Visible = false
+		OpenButton.Visible = true
+		OpenScale.Scale = 0.82
+
+		TweenService:Create(
+			OpenScale,
+			TWEEN_SMOOTH,
+			{Scale = 1}
+		):Play()
+	end)
+end
+
+CloseButton.Activated:Connect(hidePanel)
+
+----------------------------------------------------------------
+-- 主面板拖拽与边缘吸附
+----------------------------------------------------------------
+
+local mainDragging = false
+local mainDragInput: InputObject?
+local mainDragStart = Vector3.zero
+local mainStartPosition = UDim2.fromOffset(0, 0)
+
+local function snapMainToEdge()
+	local viewport = getViewportSize()
+
+	local currentX = Main.Position.X.Offset
+	local currentY = Main.Position.Y.Offset
+	local centerX = currentX + panelWidth / 2
+
+	local targetX
+
+	if centerX < viewport.X / 2 then
+		targetX = edgeMargin
+	else
+		targetX = viewport.X - panelWidth - edgeMargin
+	end
+
+	local targetY = math.clamp(
+		currentY,
+		edgeMargin,
+		math.max(edgeMargin, viewport.Y - panelHeight - edgeMargin)
+	)
+
+	TweenService:Create(
+		Main,
+		TWEEN_SNAP,
+		{
+			Position = UDim2.fromOffset(targetX, targetY),
+		}
+	):Play()
+end
+
+Header.InputBegan:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.Touch
+		and input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+		return
+	end
+
+	mainDragging = true
+	mainDragStart = input.Position
+	mainStartPosition = Main.Position
+
+	if input.UserInputType == Enum.UserInputType.Touch then
+		mainDragInput = input
+	end
+
+	input.Changed:Connect(function()
+		if input.UserInputState == Enum.UserInputState.End then
+			mainDragging = false
+			snapMainToEdge()
+		end
+	end)
+end)
+
+Header.InputChanged:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Touch
+		or input.UserInputType == Enum.UserInputType.MouseMovement then
+
+		mainDragInput = input
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if not mainDragging or input ~= mainDragInput then
+		return
+	end
+
+	local delta = input.Position - mainDragStart
+
+	Main.Position = clampMainPosition(
+		UDim2.new(
+			mainStartPosition.X.Scale,
+			mainStartPosition.X.Offset + delta.X,
+			mainStartPosition.Y.Scale,
+			mainStartPosition.Y.Offset + delta.Y
+		)
+	)
+end)
+
+----------------------------------------------------------------
+-- 悬浮球拖拽
+----------------------------------------------------------------
+
+local orbDragging = false
+local orbDragInput: InputObject?
+local orbDragStart = Vector3.zero
+local orbStartPosition = UDim2.fromOffset(0, 0)
+local orbMoved = false
+local lastOrbDragEnd = 0
+
+local function snapOrbToEdge()
+	local viewport = getViewportSize()
+
+	local centerX = OpenButton.Position.X.Offset + orbSize / 2
+	local targetX
+
+	if centerX < viewport.X / 2 then
+		targetX = edgeMargin
+	else
+		targetX = viewport.X - orbSize - edgeMargin
+	end
+
+	local targetY = math.clamp(
+		OpenButton.Position.Y.Offset,
+		edgeMargin,
+		math.max(edgeMargin, viewport.Y - orbSize - edgeMargin)
+	)
+
+	TweenService:Create(
+		OpenButton,
+		TWEEN_SNAP,
+		{
+			Position = UDim2.fromOffset(targetX, targetY),
+		}
+	):Play()
+end
+
+OpenButton.InputBegan:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.Touch
+		and input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+		return
+	end
+
+	orbDragging = true
+	orbMoved = false
+	orbDragStart = input.Position
+	orbStartPosition = OpenButton.Position
+
+	if input.UserInputType == Enum.UserInputType.Touch then
+		orbDragInput = input
+	end
+
+	input.Changed:Connect(function()
+		if input.UserInputState == Enum.UserInputState.End then
+			orbDragging = false
+
+			if orbMoved then
+				lastOrbDragEnd = os.clock()
+				snapOrbToEdge()
+			end
+		end
+	end)
+end)
+
+OpenButton.InputChanged:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Touch
+		or input.UserInputType == Enum.UserInputType.MouseMovement then
+
+		orbDragInput = input
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if not orbDragging or input ~= orbDragInput then
+		return
+	end
+
+	local delta = input.Position - orbDragStart
+
+	if delta.Magnitude > 7 then
+		orbMoved = true
+	end
+
+	OpenButton.Position = clampOrbPosition(
+		UDim2.new(
+			orbStartPosition.X.Scale,
+			orbStartPosition.X.Offset + delta.X,
+			orbStartPosition.Y.Scale,
+			orbStartPosition.Y.Offset + delta.Y
+		)
+	)
+end)
+
+OpenButton.Activated:Connect(function()
+	if os.clock() - lastOrbDragEnd < 0.18 then
+		return
+	end
+
+	showPanel()
+end)
+
+----------------------------------------------------------------
+-- 服务器反馈
+----------------------------------------------------------------
+
+FeedbackRemote.OnClientEvent:Connect(function(
+	feedbackType: string,
+	keyOrMessage: any,
+	value: any
+)
+	if feedbackType == "State" then
+		local key = keyOrMessage
+		serverState[key] = value == true
+
+		if key == "Fly" then
+			if serverState.Fly then
+				startFly()
+			else
+				stopFly()
+			end
+		end
+
+		if updateVisibleCards then
+			updateVisibleCards()
+		end
+
+	elseif feedbackType == "Toast" then
+		showToast(tostring(keyOrMessage))
+
+	elseif feedbackType == "Panic" then
+		resetLocalFeatures()
+		stopFly()
+	end
+end)
+
+----------------------------------------------------------------
+-- 屏幕旋转和尺寸变化
+----------------------------------------------------------------
+
+local viewportConnection: RBXScriptConnection?
+
+local function bindCurrentCamera()
+	if viewportConnection then
+		viewportConnection:Disconnect()
+		viewportConnection = nil
+	end
+
+	local camera = Workspace.CurrentCamera
+
+	if not camera then
+		return
+	end
+
+	viewportConnection = camera:GetPropertyChangedSignal(
+		"ViewportSize"
+	):Connect(function()
+		updatePanelGeometry(false)
+		applyFOV()
+	end)
+end
+
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+	bindCurrentCamera()
+	updatePanelGeometry(false)
+	applyFOV()
+end)
+
+----------------------------------------------------------------
+-- 初始化
+----------------------------------------------------------------
+
+updatePanelGeometry(true)
+bindCurrentCamera()
+switchPage(1, true)
+
+if serverState.Fly then
+	task.defer(startFly)
+end
